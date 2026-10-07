@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <meta name="theme-color" content="#0b63ce">
-<title>SPIRO</title>
+<title>SPIRO — Espace Utilisateur</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:Arial,Helvetica,sans-serif;background:#edf4ff;color:#172033;min-height:100vh}
@@ -1720,7 +1720,7 @@ button{appearance:none;-webkit-tap-highlight-color:transparent}
 // SPIRO — authentification renforcée.
 // Le mot de passe est géré par Firebase Authentication et n'est jamais stocké dans Firestore/localStorage.
 let initializeApp = null, getFirestore = null, doc = null, getDoc = null, setDoc = null;
-let collection = null, getDocs = null, query = null, where = null, serverTimestamp = null, onSnapshot = null;
+let collection = null, getDocs = null, query = null, where = null, serverTimestamp = null, onSnapshot = null, runTransaction = null;
 let getAuth = null, createUserWithEmailAndPassword = null, signInWithEmailAndPassword = null;
 let signOut = null, onAuthStateChanged = null, updateProfile = null, sendPasswordResetEmail = null;
 let db = null, auth = null;
@@ -1741,7 +1741,7 @@ async function initFirebaseOptional(){
     const authMod = await import("https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js");
 
     initializeApp = appMod.initializeApp;
-    ({getFirestore, doc, getDoc, setDoc, collection, getDocs, query, where, serverTimestamp, onSnapshot} = fsMod);
+    ({getFirestore, doc, getDoc, setDoc, collection, getDocs, query, where, serverTimestamp, onSnapshot, runTransaction} = fsMod);
     ({getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut,
       onAuthStateChanged, updateProfile, sendPasswordResetEmail} = authMod);
 
@@ -2190,6 +2190,7 @@ async function syncReferralRegistry(user=currentUser){
     refCode:code,
     sponsorCode:String(user.sponsorCode||user.ref||"").trim().toUpperCase(),
     ancestorCodes,
+    referralLevel:user.sponsorCode ? 1 : 0,
     activeProduct:active?{name:active.name,amount:Number(active.amount||0),daily:Number(active.daily||0),activatedAt:active.activatedAt||""}:null,
     updatedAt:serverTimestamp?serverTimestamp():new Date().toISOString()
   };
@@ -2519,6 +2520,7 @@ async function register(){
           currentUser.sponsorCode=sponsorCode;
           currentUser.ref=sponsorCode;
           currentUser.ancestorCodes=await getSponsorAncestorCodes(sponsorCode);
+          currentUser.referralLevel=1;
           currentUser.history = Array.isArray(currentUser.history) ? currentUser.history : [];
           currentUser.history.unshift({
             type:"Inscription par parrainage",
@@ -2861,6 +2863,22 @@ function renderProducts(){
 // Commissions de parrainage : 30 % au niveau 1, 3 % au niveau 2, 1 % au niveau 3.
 // Toutes les commissions sont calculées et enregistrées en CDF (FC).
 const REFERRAL_COMMISSION_RATES = {1: 0.30, 2: 0.03, 3: 0.01};
+const REFERRAL_LEVEL_LABELS = {1:"Niveau 1 — 30 %",2:"Niveau 2 — 3 %",3:"Niveau 3 — 1 %"};
+
+// Structure officielle du réseau :
+// A invite B  => B est Niveau 1 chez A.
+// B invite C  => C est Niveau 1 chez B et Niveau 2 chez A.
+// C invite D  => D est Niveau 1 chez C, Niveau 2 chez B et Niveau 3 chez A.
+// Le tableau ancestorCodes conserve cet ordre : [parrain direct, niveau 2, niveau 3].
+function getReferralLevelForMember(member, owner=currentUser){
+  const ownerCode=String(owner?.refCode||"").trim().toUpperCase();
+  if(!ownerCode || !member) return 0;
+  const ancestors=Array.isArray(member.ancestorCodes)
+    ? member.ancestorCodes.map(x=>String(x||"").trim().toUpperCase()).filter(Boolean)
+    : [];
+  const index=ancestors.indexOf(ownerCode);
+  return index>=0 && index<3 ? index+1 : 0;
+}
 
 // Cette fonction est conservée pour la logique de parrainage,
 // mais elle n'est plus appelée lors d'une activation côté utilisateur.
@@ -2923,57 +2941,112 @@ async function awardReferralCommissions(investmentAmount, sourceUser = currentUs
   }
 }
 
-async function handleProductClick(i){
-  currentSelectedProduct = products[i];
-  ensureIncomeBreakdown(currentUser);
-  const totalAvailable = getAvailableBalance(currentUser);
-  
-  if(totalAvailable >= currentSelectedProduct.amountNum){
-    if(confirm("Votre solde / bonus est suffisant. Voulez-vous activer directement " + currentSelectedProduct.name + " ?")){
-      let spend = Number(currentSelectedProduct.amountNum||0);
-      const fromBonus = Math.min(Number(currentUser.bonus||0), spend);
-      currentUser.bonus -= fromBonus; spend -= fromBonus;
-      const fromTeam = Math.min(Number(currentUser.teamIncome||0), spend);
-      currentUser.teamIncome -= fromTeam; spend -= fromTeam;
-      currentUser.productIncome = Math.max(0, Number(currentUser.productIncome||0) - spend);
-      syncMainBalance(currentUser);
-      currentUser.products = currentUser.products || [];
-      currentUser.products.push({
-        name: currentSelectedProduct.name,
-        amount: currentSelectedProduct.amountNum,
-        daily: Number(currentSelectedProduct.gainNum || currentSelectedProduct.daily.replace(/[^0-9]/g, "")),
-        totalAfterGain: Number(currentSelectedProduct.totalNum || 0),
-        durationDays: currentSelectedProduct.durationDays,
-        totalPayouts: 0,
-        payoutCount: 0,
-        image: cakeImages[i] || currentSelectedProduct.image,
-        activatedAt: new Date().toLocaleString("fr-FR"),
-        activatedAtMs: Date.now(),
-        nextPayoutAt: Date.now() + 24*60*60*1000,
-        status: "Actif"
-      });
-      currentUser.history.unshift({
-        type: "Activation produit",
-        amount: currentSelectedProduct.amountNum,
-        status: "Réussi avec succès",
-        date: new Date().toLocaleString("fr-FR"),
-        method: "Solde / Bonus"
-      });
-      
-            // Les commissions de parrainage sont distribuées uniquement après
-      // l'approbation du dépôt par l'administrateur.
-      const saved = await persistCurrentUser();
-      if(!saved) return;
-      await syncReferralRegistry(currentUser);
 
-      updateUI();
-      toast("Produit activé avec succès !");
-      showPage("active-products");
+/* ===== SECURITE DES OPERATIONS FINANCIERES ===== */
+let financialActionLock = false;
+let lastFinancialActionKey = "";
+let lastFinancialActionAt = 0;
+
+function userFinancialDocRef(user){
+  if(!db || !doc || !user) return null;
+  const country=String(user.country||"CD").toUpperCase();
+  const phone=String(normalizePhone(user.phone||"")||"");
+  return doc(db,"users",country+"_"+phone);
+}
+
+function beginFinancialAction(key, buttonId){
+  const now=Date.now();
+  if(financialActionLock) return false;
+  if(key && key===lastFinancialActionKey && now-lastFinancialActionAt<5000) return false;
+  financialActionLock=true;
+  lastFinancialActionKey=key||"";
+  lastFinancialActionAt=now;
+  const btn=buttonId?document.getElementById(buttonId):null;
+  if(btn){ btn.disabled=true; btn.dataset.originalText=btn.textContent; btn.textContent="Traitement…"; btn.style.opacity=".65"; }
+  document.querySelectorAll(".buy, #withdrawSubmitBtn").forEach(b=>{ b.disabled=true; b.style.pointerEvents="none"; b.style.opacity=".65"; });
+  return true;
+}
+function endFinancialAction(buttonId){
+  const btn=buttonId?document.getElementById(buttonId):null;
+  if(btn){ btn.disabled=false; btn.textContent=btn.dataset.originalText||btn.textContent; btn.style.opacity="1"; }
+  document.querySelectorAll(".buy, #withdrawSubmitBtn").forEach(b=>{ b.disabled=false; b.style.pointerEvents=""; b.style.opacity="1"; });
+  financialActionLock=false;
+}
+
+function deductFunds(user, amount){
+  let remaining=Number(amount||0);
+  if(!user || remaining<=0) return {ok:false,remaining};
+  ensureIncomeBreakdown(user);
+  const buckets=["bonus","teamIncome","productIncome","manualBalance"];
+  const used={bonus:0,teamIncome:0,productIncome:0,manualBalance:0};
+  for(const key of buckets){
+    const available=Math.max(0,Number(user[key]||0));
+    const take=Math.min(available,remaining);
+    user[key]=Number((available-take).toFixed(2));
+    used[key]=Number(take.toFixed(2));
+    remaining=Number((remaining-take).toFixed(2));
+    if(remaining<=0) break;
+  }
+  syncMainBalance(user);
+  return {ok:remaining<=0,remaining,used};
+}
+
+function appendHistoryOnce(user, entry, uniqueKey){
+  user.history=Array.isArray(user.history)?user.history:[];
+  if(uniqueKey && user.history.some(h=>String(h.operationKey||"")===String(uniqueKey))) return false;
+  user.history.unshift({...entry,operationKey:uniqueKey||undefined});
+  return true;
+}
+
+async function handleProductClick(i){
+  if(!currentUser || !products[i]) return;
+  const product=products[i];
+  const key="ACTIVATE:"+String(currentUser.uid||currentUser.phone||"")+":"+String(product.id||product.name||i);
+  if(!beginFinancialAction(key)) return toast("Cette opération est déjà en cours. Veuillez patienter.");
+  try{
+    currentSelectedProduct=product;
+    ensureIncomeBreakdown(currentUser);
+    const totalAvailable=getAvailableBalance(currentUser);
+    if(totalAvailable < Number(product.amountNum||0)){
+      openAutomaticDepositForProduct(product);
       return;
     }
-  }
+    if(!confirm("Votre solde est suffisant. Voulez-vous activer directement "+product.name+" pour "+Number(product.amountNum||0).toLocaleString("fr-FR")+" FC ?")) return;
 
-  openAutomaticDepositForProduct(currentSelectedProduct);
+    const ref=userFinancialDocRef(currentUser);
+    if(!ref || !runTransaction) throw new Error("Firebase Transaction indisponible.");
+    const operationKey="ACT-"+String(auth?.currentUser?.uid||currentUser.phone)+"-"+String(product.id||product.name||i);
+    await runTransaction(db, async tx=>{
+      const snap=await tx.get(ref);
+      if(!snap.exists()) throw new Error("Compte Firebase introuvable.");
+      const fresh={...snap.data(),phone:currentUser.phone};
+      ensureIncomeBreakdown(fresh);
+      if(Array.isArray(fresh.history) && fresh.history.some(h=>String(h.operationKey||"")===operationKey)) return;
+      const amount=Number(product.amountNum||0);
+      if(Number(fresh.balance||0)<amount) throw new Error("Solde insuffisant.");
+      const spent=deductFunds(fresh,amount);
+      if(!spent.ok) throw new Error("Solde insuffisant.");
+      fresh.products=Array.isArray(fresh.products)?fresh.products:[];
+      fresh.products.push({
+        name:product.name,amount,daily:Number(product.gainNum||product.daily.replace(/[^0-9]/g,"")),
+        totalAfterGain:Number(product.totalNum||0),durationDays:product.durationDays,totalPayouts:0,payoutCount:0,
+        image:cakeImages[i]||product.image,activatedAt:new Date().toLocaleString("fr-FR"),activatedAtMs:Date.now(),
+        nextPayoutAt:Date.now()+24*60*60*1000,status:"Actif",operationKey
+      });
+      appendHistoryOnce(fresh,{type:"Activation produit",amount,status:"Réussi avec succès",date:new Date().toLocaleString("fr-FR"),method:"Solde principal",operationKey},operationKey);
+      const clean=sanitizeForFirestore({...fresh,uid:auth.currentUser.uid,updatedAt:new Date().toISOString()});
+      delete clean.pass;delete clean.password;delete clean.passwordHash;
+      tx.set(ref,clean,{merge:true});
+      currentUser={...currentUser,...fresh};
+    });
+    await syncReferralRegistry(currentUser);
+    updateUI();
+    toast("Produit activé. Le montant a été retiré automatiquement de votre solde.");
+    showPage("active-products");
+  }catch(e){
+    console.error("Activation produit:",e);
+    toast(e.message||"Impossible d'activer le produit.");
+  }finally{ endFinancialAction(); }
 }
 
 const AUTO_PAYMENT_PUBLIC_KEY = "pk_live_b9df4d28452147efb40ccf9371087953";
@@ -4232,84 +4305,46 @@ function updateWithdrawalAvailability(){
 }
 
 async function makeWithdraw(){
-  const amount = Number(document.getElementById("withdrawAmount").value);
-  const phone = document.getElementById("withdrawPhone").value.trim();
-  const method = document.getElementById("withdrawMethod").value;
-  const active = (currentUser.products || []).filter(p => p.status === "Actif");
-
-  const availableBalance = getAvailableBalance(currentUser);
-  if(availableBalance < WITHDRAWAL_RULES.minAmount){
-    toast("Retrait impossible : votre solde doit contenir au moins 5 500 FC.");
-    return;
-  }
-
-  if(amount < WITHDRAWAL_RULES.minAmount){
-    toast("Le montant minimum de retrait est de 5 500 FC.");
-    return;
-  }
-  
-  if(active.length === 0){
-    toast("Le retrait nécessite au moins un plan actif.");
-    return;
-  }
-
-  ensureIncomeBreakdown(currentUser);
-  const totalBalance = getAvailableBalance(currentUser);
-  if(amount > totalBalance){
-    toast("Solde insuffisant.");
-    return;
-  }
-  if(!phone){
-    toast("Veuillez entrer le numéro de réception.");
-    return;
-  }
-  if(!method){
-    toast("Aucun moyen de retrait disponible pour votre pays.");
-    return;
-  }
-
-  const fee = Math.round(amount * WITHDRAWAL_RULES.feeRate);
-  const net = amount - fee;
-
-  if(!confirm("Confirmer le retrait ?\n\nMontant : " + amount.toLocaleString("fr-FR") + " FC\nFrais (15 %) : " + fee.toLocaleString("fr-FR") + " FC\nNet à recevoir : " + net.toLocaleString("fr-FR") + " FC\nLa demande est envoyée pour traitement automatique via le service de paiement.")){
-    return;
-  }
-
-  let remaining = amount;
-  const fromBonus = Math.min(Number(currentUser.bonus||0), remaining);
-  currentUser.bonus -= fromBonus; remaining -= fromBonus;
-  const fromTeam = Math.min(Number(currentUser.teamIncome||0), remaining);
-  currentUser.teamIncome -= fromTeam; remaining -= fromTeam;
-  const fromProduct = Math.min(Number(currentUser.productIncome||0), remaining);
-  currentUser.productIncome = Math.max(0, Number(currentUser.productIncome||0) - fromProduct);
-  remaining -= fromProduct;
-  // Le solde manuel/admin fait partie du solde principal : il doit aussi
-  // être débité si les autres composantes ne suffisent pas.
-  if(remaining > 0){
-    const fromManual = Math.min(Number(currentUser.manualBalance||0), remaining);
-    currentUser.manualBalance = Math.max(0, Number(currentUser.manualBalance||0) - fromManual);
-    remaining -= fromManual;
-  }
-  syncMainBalance(currentUser);
-
-  currentUser.history.unshift({
-    type: "Retrait",
-    amount,
-    fee,
-    net,
-    status: "En cours",
-    date: new Date().toLocaleString("fr-FR"),
-    method,
-    phone,
-    ref: "WD-" + Date.now() + "-" + String(currentUser.phone||"").slice(-4)
-  });
-
-  const saved = await persistCurrentUser();
-  if(!saved) return;
-
-  updateUI();
-  toast("Demande de retrait envoyée avec succès. Elle apparaît maintenant dans l’historique des retraits avec le statut « En cours ». ");
-  showPage("history");
+  if(!currentUser) return;
+  const amount=Number(document.getElementById("withdrawAmount").value);
+  const phone=document.getElementById("withdrawPhone").value.trim();
+  const method=document.getElementById("withdrawMethod").value;
+  const active=(currentUser.products||[]).filter(p=>p.status==="Actif");
+  const operationKey="WD-"+String(auth?.currentUser?.uid||currentUser.phone)+":"+String(amount)+":"+String(phone)+":"+String(method);
+  if(!beginFinancialAction(operationKey,"withdrawSubmitBtn")) return toast("Cette demande de retrait est déjà en cours.");
+  try{
+    if(getAvailableBalance(currentUser)<WITHDRAWAL_RULES.minAmount){toast("Retrait impossible : votre solde doit contenir au moins 5 500 FC.");return;}
+    if(amount<WITHDRAWAL_RULES.minAmount){toast("Le montant minimum de retrait est de 5 500 FC.");return;}
+    if(active.length===0){toast("Le retrait nécessite au moins un plan actif.");return;}
+    if(amount>getAvailableBalance(currentUser)){toast("Solde insuffisant.");return;}
+    if(!phone){toast("Veuillez entrer le numéro de réception.");return;}
+    if(!method){toast("Aucun moyen de retrait disponible pour votre pays.");return;}
+    const fee=Math.round(amount*WITHDRAWAL_RULES.feeRate), net=amount-fee;
+    if(!confirm("Confirmer le retrait ?\n\nMontant : "+amount.toLocaleString("fr-FR")+" FC\nFrais (15 %) : "+fee.toLocaleString("fr-FR")+" FC\nNet à recevoir : "+net.toLocaleString("fr-FR")+" FC")) return;
+    const ref=userFinancialDocRef(currentUser);
+    if(!ref || !runTransaction) throw new Error("Firebase Transaction indisponible.");
+    await runTransaction(db,async tx=>{
+      const snap=await tx.get(ref);
+      if(!snap.exists()) throw new Error("Compte Firebase introuvable.");
+      const fresh={...snap.data(),phone:currentUser.phone};
+      ensureIncomeBreakdown(fresh);
+      if(Array.isArray(fresh.history) && fresh.history.some(h=>String(h.operationKey||"")===operationKey)) return;
+      if(Number(fresh.balance||0)<amount) throw new Error("Solde insuffisant.");
+      const spent=deductFunds(fresh,amount);
+      if(!spent.ok) throw new Error("Solde insuffisant.");
+      appendHistoryOnce(fresh,{type:"Retrait",amount,fee,net,status:"En cours",date:new Date().toLocaleString("fr-FR"),method,phone,ref:operationKey,operationKey},operationKey);
+      const clean=sanitizeForFirestore({...fresh,uid:auth.currentUser.uid,updatedAt:new Date().toISOString()});
+      delete clean.pass;delete clean.password;delete clean.passwordHash;
+      tx.set(ref,clean,{merge:true});
+      currentUser={...currentUser,...fresh};
+    });
+    updateUI();
+    toast("Retrait enregistré : votre solde a été débité automatiquement et la demande est dans l'historique.");
+    showPage("history");
+  }catch(e){
+    console.error("Retrait:",e);
+    toast(e.message||"Impossible d'enregistrer le retrait.");
+  }finally{ endFinancialAction("withdrawSubmitBtn"); }
 }
 
 document.addEventListener("input", function(e){
@@ -4356,6 +4391,20 @@ function renderHistory(filter = "deposits"){
     return;
   }
 
+  const historyStatusText = (h) => {
+    const raw = String(h.status || "").trim().toLowerCase();
+    if(["approuvé","approuve","approved","validé","valide","accepté","accepte","réussi","reussi","réussi avec succès","reussi avec succes"].includes(raw)){
+      return "Reçu avec succès";
+    }
+    if(["rejeté","rejete","rejected","refusé","refuse","annulé","annule"].includes(raw)){
+      return "Votre demande a été rejetée";
+    }
+    if(["en cours","pending","en attente","vérification en cours","verification en cours","processing"].includes(raw)){
+      return "Patientez dans quelques minutes";
+    }
+    return h.status || "—";
+  };
+
   box.innerHTML = tabs + '<div class="history-section-title">' + title + '</div>' +
     selected.map(h => `
       <div class="team-row history-row">
@@ -4366,7 +4415,7 @@ function renderHistory(filter = "deposits"){
         </div>
         <div style="text-align:right">
           <b>${Number(h.amount || 0).toLocaleString("fr-FR")} FC</b>
-          <p style="font-size:11px;color:#169447;margin-top:4px">Statut : ${h.status || "—"}</p>
+          <p style="font-size:11px;color:#169447;margin-top:4px">${historyStatusText(h)}</p>
         </div>
       </div>`).join("");
 }
@@ -4479,12 +4528,18 @@ async function renderTeamMembers(){
     document.getElementById("lvl2Count").textContent=levels[2].length;
     document.getElementById("lvl3Count").textContent=levels[3].length;
     if(!total){ box.innerHTML='<div class="empty">Aucun membre dans votre équipe pour le moment.</div>'; return; }
-    box.innerHTML=`<p style="font-size:12px;color:#536279;font-weight:bold">${total} membre(s) dans votre équipe</p>
-      <div class="team-level-title">NIVEAU 1 — 30 %</div>
+    box.innerHTML=`<div style="background:#f4f8ff;border:1px solid #dbe8ff;border-radius:14px;padding:12px;margin-bottom:12px;font-size:12px;color:#31415c;line-height:1.55">
+      <b style="color:#0b63ce">Structure du parrainage</b><br>
+      Niveau 1 : parrain direct — <b>30 %</b><br>
+      Niveau 2 : filleul du filleul — <b>3 %</b><br>
+      Niveau 3 : troisième génération — <b>1 %</b><br>
+      <span style="color:#687386">Les commissions sont calculées sur l’investissement du membre concerné.</span>
+    </div><p style="font-size:12px;color:#536279;font-weight:bold">${total} membre(s) dans votre équipe</p>
+      <div class="team-level-title">${REFERRAL_LEVEL_LABELS[1]}</div>
       ${levels[1].length ? levels[1].map(u=>memberCard(u,1,'30 %')).join('') : '<div class="empty">Aucun membre au niveau 1.</div>'}
-      <div class="team-level-title">NIVEAU 2 — 3 %</div>
+      <div class="team-level-title">${REFERRAL_LEVEL_LABELS[2]}</div>
       ${levels[2].length ? levels[2].map(u=>memberCard(u,2,'3 %')).join('') : '<div class="empty">Aucun membre au niveau 2.</div>'}
-      <div class="team-level-title">NIVEAU 3 — 1 %</div>
+      <div class="team-level-title">${REFERRAL_LEVEL_LABELS[3]}</div>
       ${levels[3].length ? levels[3].map(u=>memberCard(u,3,'1 %')).join('') : '<div class="empty">Aucun membre au niveau 3.</div>'}`;
   }catch(e){ console.error(e); box.innerHTML='<div class="empty">Impossible de charger l’équipe.</div>'; }
 }
