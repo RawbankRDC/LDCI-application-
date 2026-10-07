@@ -1572,13 +1572,12 @@ button{appearance:none;-webkit-tap-highlight-color:transparent}
         <label>Montant souhaité</label>
         <input id="withdrawAmount" type="number" min="5500" step="1" placeholder="Minimum 5 500 FC"><p class="withdraw-note">Minimum de retrait : <strong>5 500 FC</strong> • Frais : <strong>15 %</strong> • Traitement : <strong>Retrait automatique</strong>.</p><div id="withdrawAvailabilityNote" class="withdraw-note" style="margin-top:8px">Retraits disponibles 24h/24 • Traitement automatique selon la disponibilité du service de paiement.</div>
         <p id="withdrawCalculation" style="font-size:12px;color:#0b63ce;margin-top:7px;font-weight:bold"></p>
+        <div id="withdrawCountryInfo" class="withdraw-note" style="margin-top:8px">Pays du compte : — • Moyens de retrait disponibles : —</div>
         <label>Numéro de réception</label>
-        <input id="withdrawPhone" type="tel" placeholder="Numéro Mobile Money">
+        <input id="withdrawPhone" type="tel" inputmode="numeric" placeholder="Numéro Mobile Money">
         <label>Canal de réception</label>
         <select id="withdrawMethod">
-          <option>Vodacom (M-Pesa)</option>
-          <option>Airtel Money</option>
-          <option>Orange Money</option>
+          <option value="">Chargement des moyens disponibles…</option>
         </select>
         <button id="withdrawSubmitBtn" class="primary" onclick="makeWithdraw()">Confirmer la demande</button>
       </div>
@@ -1835,6 +1834,12 @@ const LONGWAY_COUNTRIES = {
   CD:{code:"CD",name:"République démocratique du Congo",flag:"🇨🇩",prefix:"+243",dial:"243",currency:"FC",digits:9}
 };
 
+function isValidCountryPhone(phone,countryCode){
+  const c=getCountryData(countryCode);
+  const p=String(phone||"").replace(/\D/g,"");
+  return !!c && p.length===c.digits;
+}
+
 function getCountryData(code){
   return LONGWAY_COUNTRIES[String(code||"").toUpperCase()] || LONGWAY_COUNTRIES.CD;
 }
@@ -1857,8 +1862,10 @@ function countryPhone(value,countryCode){
   const c=getCountryData(countryCode);
   if(p.startsWith(c.prefix)) p=p.slice(c.prefix.length);
   if(p.startsWith(c.dial) && p.length>=c.dial.length+c.digits) p=p.slice(c.dial.length);
-  if(p.startsWith("0")) p=p.slice(1);
-  return p.replace(/\D/g,"");
+  // Le 0 initial fait partie du numéro national en Côte d’Ivoire.
+  p=p.replace(/\D/g,"");
+  if(p.length > c.digits && p.startsWith("0")) p=p.slice(1);
+  return p;
 }
 function updateAuthCountryUI(mode){
   const isLogin = mode === "login";
@@ -1941,8 +1948,13 @@ function normalizePhone(value){
     if(p.startsWith(c.prefix)){ p=p.slice(c.prefix.length); break; }
     if(raw.startsWith(c.dial) && raw.length >= c.dial.length + c.digits){ p=raw.slice(c.dial.length); break; }
   }
-  if(p.startsWith("0")) p = p.slice(1);
-  return p.replace(/\D/g, "");
+  p=p.replace(/\D/g, "");
+  // Ne pas supprimer le 0 si le numéro est déjà à la longueur nationale.
+  const digitsForCountry = currentUser?.country
+    ? (LONGWAY_COUNTRIES[String(currentUser.country).toUpperCase()]?.digits || 0)
+    : 0;
+  if(digitsForCountry && p.length > digitsForCountry && p.startsWith("0")) p=p.slice(1);
+  return p;
 }
 
 function readLocalUsers(){
@@ -2416,7 +2428,7 @@ async function register(){
     toast("Veuillez remplir tous les champs obligatoires et choisir votre pays.");
     return;
   }
-  if(!new RegExp("^\\d{"+country.digits+"}$").test(phone)){
+  if(!isValidCountryPhone(phone,countryCode)){
     toast("Veuillez entrer les "+country.digits+" chiffres après "+country.prefix+".");
     return;
   }
@@ -2568,7 +2580,7 @@ async function login(){
     toast("Veuillez choisir votre pays et remplir tous les champs.");
     return;
   }
-  if(!new RegExp("^\\d{"+country.digits+"}$").test(phone)){
+  if(!isValidCountryPhone(phone,countryCode)){
     toast("Veuillez entrer les "+country.digits+" chiffres après "+country.prefix+".");
     return;
   }
@@ -2822,6 +2834,7 @@ function showPage(page){
   }
 
   if(page === "home") { try { startCakeCarousel(); } catch(e) { console.error("Carousel gâteaux:", e); } }
+  if(page === "withdraw") { try { updateWithdrawalMethods(); } catch(e) { console.error("Moyens de retrait:", e); } }
   window.scrollTo(0,0);
 }
 
@@ -4136,6 +4149,68 @@ function getWithdrawalClosedMessage(){
   return "Les retraits sont disponibles 24h/24. Le traitement automatique dépend de la disponibilité du service de paiement.";
 }
 
+function getWithdrawalNetworksForUser(user=currentUser){
+  const countryCode=String(user?.country||"CD").toUpperCase();
+  const data=typeof AUTO_PAYMENT_COUNTRIES !== "undefined" ? AUTO_PAYMENT_COUNTRIES[countryCode] : null;
+
+  // Pour la RDC, seuls les trois moyens demandés sont proposés.
+  if(countryCode === "CD") return [
+    {id:"airtel",name:"Airtel Money",sub:"Airtel Money"},
+    {id:"orange",name:"Orange Money",sub:"Orange Money"},
+    {id:"vodacom",name:"Vodacom",sub:"M-Pesa"}
+  ];
+
+  // Pour les autres pays, les moyens correspondent automatiquement au pays
+  // choisi lors de l'inscription/connexion, à partir de la liste pays du HTML.
+  if(data && Array.isArray(data.networks)) return data.networks;
+  return [];
+}
+
+function updateWithdrawalMethods(){
+  const select=document.getElementById("withdrawMethod");
+  const phone=document.getElementById("withdrawPhone");
+  const info=document.getElementById("withdrawCountryInfo");
+  if(!select) return;
+
+  const country=getUserCountry(currentUser || {country:"CD"});
+  const networks=getWithdrawalNetworksForUser(currentUser);
+  select.innerHTML="";
+
+  if(!networks.length){
+    const option=document.createElement("option");
+    option.value="";
+    option.textContent="Aucun moyen disponible pour ce pays";
+    select.appendChild(option);
+    select.disabled=true;
+    if(info) info.textContent=country.flag+" "+(country.code==="CD"?"RDC":country.name)+" • Aucun moyen de retrait disponible actuellement.";
+    if(phone){
+      phone.placeholder="Numéro de réception";
+      phone.removeAttribute("data-prefix");
+    }
+    return;
+  }
+
+  select.disabled=false;
+  networks.forEach((net,index)=>{
+    const option=document.createElement("option");
+    option.value=net.name;
+    option.textContent=net.name + (net.sub && net.sub!==net.name ? " ("+net.sub+")" : "");
+    option.dataset.networkId=net.id || "";
+    select.appendChild(option);
+    if(index===0) option.selected=true;
+  });
+
+  const countryName=country.code==="CD" ? "RDC" : country.name;
+  if(info){
+    info.textContent=country.flag+" "+countryName+" • Moyens disponibles : "+networks.map(n=>n.name).join(", ");
+  }
+  if(phone){
+    phone.placeholder="Numéro de réception "+country.prefix;
+    phone.setAttribute("data-prefix",country.prefix);
+    phone.setAttribute("aria-label","Numéro de réception "+country.prefix);
+  }
+}
+
 function updateWithdrawalAvailability(){
   const button = document.getElementById("withdrawSubmitBtn");
   const note = document.getElementById("withdrawAvailabilityNote");
@@ -4186,6 +4261,10 @@ async function makeWithdraw(){
   }
   if(!phone){
     toast("Veuillez entrer le numéro de réception.");
+    return;
+  }
+  if(!method){
+    toast("Aucun moyen de retrait disponible pour votre pays.");
     return;
   }
 
@@ -4506,7 +4585,8 @@ window.addEventListener("DOMContentLoaded",()=>{
         } else if(digits.startsWith(old.dial) && digits.length > old.digits){
           digits = digits.slice(old.dial.length);
         }
-        if(digits.startsWith("0")) digits = digits.slice(1);
+        // Conserver le 0 initial lorsqu’il fait partie du numéro national.
+        if(digits.length > c.digits && digits.startsWith("0")) digits = digits.slice(1);
 
         input.maxLength = c.digits;
         input.value = keepValue ? digits.slice(0, c.digits) : "";
